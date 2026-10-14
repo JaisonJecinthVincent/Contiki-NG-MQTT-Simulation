@@ -66,7 +66,7 @@
 speed_t b_rate = BAUDRATE;
 
 int verbose = 2;
-const char *ipaddr;
+char *ipaddr;
 const char *netmask;
 int slipfd = 0;
 uint16_t basedelay=0,delaymsec=0;
