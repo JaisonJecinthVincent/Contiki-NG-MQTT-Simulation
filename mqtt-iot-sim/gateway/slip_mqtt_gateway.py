@@ -41,7 +41,7 @@ logger = logging.getLogger("SLIP-Gateway")
 
 
 def slip_encode(data: bytes) -> bytes:
-    encoded = bytearray([SLIP_END])
+    encoded = bytearray()
     for b in data:
         if b == SLIP_END:
             encoded.extend([SLIP_ESC, SLIP_ESC_END])
@@ -60,6 +60,7 @@ def in_cksum(buf: bytes) -> int:
     for i in range(0, len(buf), 2):
         w = (buf[i] << 8) + buf[i + 1]
         s += w
+    while (s >> 16):
         s = (s & 0xFFFF) + (s >> 16)
     return (~s) & 0xFFFF
 
@@ -78,6 +79,8 @@ class MoteTCPConnection:
         self.mote_seq = 0
         self.gw_seq = 1000
         self.last_active = time.time()
+        self.last_broker_data = None
+        self.last_broker_seq = 0
 
     def connect_broker(self):
         try:
@@ -164,8 +167,8 @@ class SlipMqttGateway:
             0,     # Checksum placeholder
             0      # Urgent pointer
         )
-        # Calculate TCP Checksum using IPv6 pseudo-header
-        ph = self.gw_ip_bytes + dst_ip + struct.pack("!IBBB", len(tcp_hdr_noflag) + len(payload), 0, 0, 6)
+        # Calculate TCP Checksum using IPv6 pseudo-header (RFC 2460 / RFC 8200)
+        ph = self.gw_ip_bytes + dst_ip + struct.pack("!II", len(tcp_hdr_noflag) + len(payload), 6)
         csum = in_cksum(ph + tcp_hdr_noflag + payload)
         tcp_hdr = struct.pack(
             "!HHIIBBHHH",
@@ -192,7 +195,7 @@ class SlipMqttGateway:
             reply[2] = 0
             reply[3] = 0
             # Calculate ICMPv6 checksum
-            ph = self.gw_ip_bytes + src_ip + struct.pack("!IBBB", len(reply), 0, 0, 58)
+            ph = self.gw_ip_bytes + src_ip + struct.pack("!II", len(reply), 58)
             csum = in_cksum(ph + bytes(reply))
             struct.pack_into("!H", reply, 2, csum)
             self.send_ipv6_packet(src_ip, 58, bytes(reply))
@@ -207,13 +210,22 @@ class SlipMqttGateway:
         conn_key = (src_ip, src_port)
         src_ip_str = socket.inet_ntop(socket.AF_INET6, src_ip)
 
-        # SYN received: initiate broker connection
+        # SYN received: initiate broker connection or handle duplicate SYN
         if (flags & TCP_FLAG_SYN) and not (flags & TCP_FLAG_ACK):
-            logger.info(f"TCP SYN received from [{src_ip_str}]:{src_port} -> Port {dst_port}")
             if conn_key in self.tcp_conns:
-                self.tcp_conns[conn_key].close()
+                conn = self.tcp_conns[conn_key]
+                if conn.mote_seq == ((seq + 1) & 0xFFFFFFFF) and conn.connected_to_broker:
+                    # Re-send SYN-ACK without closing or recreating the connection
+                    self.send_tcp_packet(src_ip, src_port, 1000, conn.mote_seq, TCP_FLAG_SYN | TCP_FLAG_ACK)
+                    logger.debug(f"Re-sent TCP SYN-ACK for retransmitted SYN from [{src_ip_str}]:{src_port}")
+                    return
+                else:
+                    conn.close()
+
+            logger.info(f"TCP SYN received from [{src_ip_str}]:{src_port} -> Port {dst_port}")
             conn = MoteTCPConnection(src_ip, src_port, self.broker_host, self.broker_port)
             conn.mote_seq = (seq + 1) & 0xFFFFFFFF
+            conn.gw_seq = 1000
             conn.connect_broker()
             self.tcp_conns[conn_key] = conn
 
@@ -231,19 +243,42 @@ class SlipMqttGateway:
 
         # Handle incoming data (MQTT payload)
         if len(payload) > 0:
-            conn.mote_seq = (seq + len(payload)) & 0xFFFFFFFF
+            seq_end = (seq + len(payload)) & 0xFFFFFFFF
+
+            # Check for duplicate retransmission of already acknowledged data
+            diff = (conn.mote_seq - seq_end) & 0xFFFFFFFF
+            is_dup = (diff < 0x80000000)
+
+            if is_dup:
+                # Retransmission: re-send ACK
+                self.send_tcp_packet(src_ip, src_port, conn.gw_seq, conn.mote_seq, TCP_FLAG_ACK)
+                if conn.last_broker_data:
+                    self.send_tcp_packet(conn.mote_ip, conn.mote_port,
+                                         conn.last_broker_seq, conn.mote_seq,
+                                         TCP_FLAG_PSH | TCP_FLAG_ACK, conn.last_broker_data)
+                logger.debug(f"Duplicate TCP segment ({len(payload)} bytes) from [{src_ip_str}]:{src_port} (re-sent ACK)")
+                return
+
+            # If partially overlapping retransmission
+            new_payload = payload
+            overlap = (conn.mote_seq - seq) & 0xFFFFFFFF
+            if overlap < len(payload) and overlap < 0x80000000:
+                new_payload = payload[overlap:]
+
+            conn.mote_seq = seq_end
             # Send TCP ACK for the received payload
             self.send_tcp_packet(src_ip, src_port, conn.gw_seq, conn.mote_seq, TCP_FLAG_ACK)
 
-            # Forward to Mosquitto
-            try:
-                conn.broker_sock.sendall(payload)
-                mqtt_cmd = payload[0] >> 4
-                cmd_names = {1: "CONNECT", 3: "PUBLISH", 8: "SUBSCRIBE", 12: "PINGREQ", 14: "DISCONNECT"}
-                name = cmd_names.get(mqtt_cmd, f"CMD_{mqtt_cmd}")
-                logger.info(f"Forwarded {name} ({len(payload)} bytes) from [{src_ip_str}]:{src_port} to Mosquitto broker")
-            except Exception as e:
-                logger.error(f"Broker forward error: {e}")
+            # Forward only new payload to Mosquitto
+            if len(new_payload) > 0:
+                try:
+                    conn.broker_sock.sendall(new_payload)
+                    mqtt_cmd = new_payload[0] >> 4
+                    cmd_names = {1: "CONNECT", 3: "PUBLISH", 8: "SUBSCRIBE", 12: "PINGREQ", 14: "DISCONNECT"}
+                    name = cmd_names.get(mqtt_cmd, f"CMD_{mqtt_cmd}")
+                    logger.info(f"Forwarded {name} ({len(new_payload)} bytes) from [{src_ip_str}]:{src_port} to Mosquitto broker")
+                except Exception as e:
+                    logger.error(f"Broker forward error: {e}")
 
         # Handle FIN
         if flags & TCP_FLAG_FIN:
@@ -350,7 +385,9 @@ class SlipMqttGateway:
                                     cmd_names = {2: "CONNACK", 4: "PUBACK", 9: "SUBACK", 3: "PUBLISH", 13: "PINGRESP"}
                                     name = cmd_names.get(mqtt_cmd, f"RESP_{mqtt_cmd}")
                                     mote_ip_str = socket.inet_ntop(socket.AF_INET6, conn.mote_ip)
-                                    logger.info(f"Received {name} ({len(data)} bytes) from broker -> sending to [{mote_ip_str}]:{conn.mote_port}")
+                                    # Save for potential retransmission
+                                    conn.last_broker_data = data
+                                    conn.last_broker_seq = conn.gw_seq
 
                                     # Send TCP PSH+ACK packet to mote
                                     self.send_tcp_packet(conn.mote_ip, conn.mote_port,
